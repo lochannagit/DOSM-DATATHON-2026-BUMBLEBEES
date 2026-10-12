@@ -1,0 +1,650 @@
+#1 load library
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+library(forecast)
+library(ggplot2)
+
+#2 load hotel guest data
+hotel <- read_excel("C:/Users/locha/OneDrive/Desktop/DOSM DATATHON/totalhotelguests.xlsx")
+str(hotel)
+
+#3 reshape annual data 
+hotel_state <- hotel %>%
+  filter(State != "Malaysia") %>%
+  pivot_longer(
+    cols = `2017`:`2025`,
+    names_to = "Year",
+    values_to = "Hotel_Guests"
+  ) %>%
+  mutate(
+    Year = as.integer(Year)
+  ) %>%
+  arrange(State, Year)
+head(hotel_state)
+dim(hotel_state)
+
+#4 create modelling features
+hotel_features <- hotel_state %>%
+  group_by(State) %>%
+  arrange(Year) %>%
+  mutate(
+    Lag1 = lag(Hotel_Guests, 1),
+    Lag2 = lag(Hotel_Guests, 2),
+    Growth_1Y = (Hotel_Guests / Lag1) - 1
+  ) %>%
+  ungroup()
+head(hotel_features, 10)
+
+#5 time based validation
+train <- hotel_features %>%
+  filter(Year <= 2022) %>%
+  filter(!is.na(Lag1), !is.na(Lag2))
+
+test <- hotel_features %>%
+  filter(Year >= 2023) %>%
+  filter(!is.na(Lag1), !is.na(Lag2))
+dim(train)
+dim(test)
+
+#6 prepare model matrix
+x_train <- model.matrix(
+  Hotel_Guests ~ Lag1 + Lag2 + Growth_1Y + Year + State,
+  data = train
+)[, -1]
+
+y_train <- train$Hotel_Guests
+
+x_test <- model.matrix(
+  Hotel_Guests ~ Lag1 + Lag2 + Growth_1Y + Year + State,
+  data = test
+)[, -1]
+
+y_test <- test$Hotel_Guests
+dim(x_train)
+dim(x_test)
+
+#7 train, predict, calculate ridge model
+set.seed(123)
+
+ridge_model <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 0,
+  family = "gaussian",
+  standardize = TRUE
+)
+
+ridge_pred <- predict(
+  ridge_model,
+  newx = x_test,
+  s = "lambda.min"
+)[, 1]
+
+ridge_rmse <- sqrt(mean((y_test - ridge_pred)^2))
+ridge_mae <- mean(abs(y_test - ridge_pred))
+
+ridge_rmse
+ridge_mae
+
+#8 test a pooled elastic net model
+set.seed(123)
+
+elastic_model <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 0.5,
+  family = "gaussian",
+  standardize = TRUE
+)
+elastic_pred <- predict(
+  elastic_model,
+  newx = x_test,
+  s = "lambda.min"
+)[, 1]
+elastic_rmse <- sqrt(mean((y_test - elastic_pred)^2))
+elastic_mae <- mean(abs(y_test - elastic_pred))
+
+elastic_rmse
+elastic_mae
+
+#9 test with naive benchmark
+naive_pred <- test$Lag1
+naive_rmse <- sqrt(mean((y_test - naive_pred)^2))
+naive_mae <- mean(abs(y_test - naive_pred))
+
+naive_rmse
+naive_mae
+
+#10 test state specifc trend model
+trend_model <- lm(
+  Hotel_Guests ~ State + Year,
+  data = train
+)
+trend_pred <- predict(
+  trend_model,
+  newdata = test
+)
+trend_rmse <- sqrt(mean((y_test - trend_pred)^2))
+trend_mae <- mean(abs(y_test - trend_pred))
+
+trend_rmse
+trend_mae
+
+#11 check naive performance by state
+state_performance <- test %>%
+  mutate(
+    Naive_Pred = Lag1,
+    Naive_Error = Hotel_Guests - Naive_Pred,
+    Naive_Abs_Error = abs(Naive_Error)
+  ) %>%
+  group_by(State) %>%
+  summarise(
+    RMSE = sqrt(mean(Naive_Error^2)),
+    MAE = mean(Naive_Abs_Error),
+    .groups = "drop"
+  ) %>%
+  arrange(RMSE)
+state_performance
+
+#12 test recovery growth forecast
+recovery_pred <- test %>%
+  group_by(State) %>%
+  arrange(Year) %>%
+  mutate(
+    Recovery_Growth = (Lag1 / lag(Lag1)) - 1,
+    Recovery_Growth = ifelse(
+      is.na(Recovery_Growth),
+      0,
+      Recovery_Growth
+    ),
+    Predicted = Lag1 * (1 + Recovery_Growth)
+  ) %>%
+  ungroup()
+recovery_data <- hotel_state %>%
+  group_by(State) %>%
+  arrange(Year) %>%
+  mutate(
+    Growth = Hotel_Guests / lag(Hotel_Guests) - 1
+  ) %>%
+  ungroup()
+recovery_data %>%
+  filter(Year >= 2022) %>%
+  select(State, Year, Hotel_Guests, Growth) %>%
+  head(20)
+
+#13
+recent_growth <- recovery_data %>%
+  filter(Year >= 2023, Year <= 2025) %>%
+  group_by(State) %>%
+  summarise(
+    Avg_Growth = mean(Growth, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Avg_Growth))
+recent_growth
+
+#14
+growth_validation <- recovery_data %>%
+  group_by(State) %>%
+  arrange(Year) %>%
+  mutate(
+    Lag1 = lag(Hotel_Guests, 1),
+    Growth_3Y = (
+      lag(Growth, 1) +
+        lag(Growth, 2) +
+        lag(Growth, 3)
+    ) / 3,
+    Growth_Pred = Lag1 * (1 + Growth_3Y)
+  ) %>%
+  ungroup() %>%
+  filter(
+    Year >= 2023,
+    Year <= 2025,
+    !is.na(Growth_Pred)
+  )
+growth_rmse <- sqrt(
+  mean(
+    (growth_validation$Hotel_Guests -
+       growth_validation$Growth_Pred)^2
+  )
+)
+
+growth_mae <- mean(
+  abs(
+    growth_validation$Hotel_Guests -
+      growth_validation$Growth_Pred
+  )
+)
+
+growth_rmse
+growth_mae
+
+#15
+damped_results <- hotel_state %>%
+  group_by(State) %>%
+  arrange(Year) %>%
+  group_modify(~ {
+    
+    train_state <- .x %>%
+      filter(Year <= 2022)
+    
+    test_state <- .x %>%
+      filter(Year >= 2023)
+    
+    model <- holt(
+      train_state$Hotel_Guests,
+      h = nrow(test_state),
+      damped = TRUE
+    )
+    
+    tibble(
+      Year = test_state$Year,
+      Actual = test_state$Hotel_Guests,
+      Predicted = as.numeric(model$mean)
+    )
+  }) %>%
+  ungroup()
+damped_rmse <- sqrt(
+  mean((damped_results$Actual -
+          damped_results$Predicted)^2)
+)
+
+damped_mae <- mean(
+  abs(damped_results$Actual -
+        damped_results$Predicted)
+)
+
+damped_rmse
+damped_mae
+
+#16 ml
+energy <- read_excel(
+  "C:/Users/locha/OneDrive/Desktop/DOSM DATATHON/Energy Consumption by States.xlsx",
+  sheet = "total"
+)
+waste_ml <- read_excel(
+  "C:/Users/locha/OneDrive/Desktop/DOSM DATATHON/waste states (1).xlsx"
+)
+energy_state <- energy %>%
+  pivot_longer(
+    cols = -Year,
+    names_to = "State",
+    values_to = "Electricity"
+  ) %>%
+  mutate(
+    Electricity = as.numeric(
+      gsub(",", "", Electricity)
+    )
+  )
+dim(energy_state)
+dim(waste_ml)
+
+profile_2024 <- hotel_state %>%
+  filter(Year == 2024) %>%
+  select(State, Hotel_Guests) %>%
+  left_join(
+    energy_state %>%
+      filter(Year == 2024) %>%
+      select(State, Electricity),
+    by = "State"
+  ) %>%
+  left_join(
+    waste_ml %>%
+      filter(Year == 2024) %>%
+      select(State, `Estimated Waste Per Year (kg)`),
+    by = "State"
+  )
+dim(profile_2024)
+profile_2024
+
+profile_2024 <- profile_2024 %>%
+  left_join(
+    hotel %>%
+      filter(State != "Malaysia") %>%
+      select(State, `2026 Q1`) %>%
+      distinct(),
+    by = "State"
+  )
+
+tourism_2024 <- read_excel(
+  "C:/Users/locha/OneDrive/Desktop/DOSM DATATHON/Tourism Demand.xlsx"
+) %>%
+  filter(Year == 2024) %>%
+  select(State, `Population ('000)`)
+
+profile_2024 <- profile_2024 %>%
+  left_join(
+    tourism_2024,
+    by = "State"
+  )
+
+profile_2024 <- profile_2024 %>%
+  mutate(
+    Tourism_Intensity =
+      Hotel_Guests / `Population ('000)`
+  )
+
+profile_2024 %>%
+  select(
+    State,
+    Tourism_Intensity,
+    Electricity,
+    `Estimated Waste Per Year (kg)`
+  )
+
+# 17 create resource pressure
+profile_2024 <- profile_2024 %>%
+  mutate(
+    Electricity_Pressure = (
+      Electricity - min(Electricity, na.rm = TRUE)
+    ) / (
+      max(Electricity, na.rm = TRUE) -
+        min(Electricity, na.rm = TRUE)
+    ),
+    
+    Waste_Pressure = (
+      `Estimated Waste Per Year (kg)` -
+        min(`Estimated Waste Per Year (kg)`, na.rm = TRUE)
+    ) / (
+      max(`Estimated Waste Per Year (kg)`, na.rm = TRUE) -
+        min(`Estimated Waste Per Year (kg)`, na.rm = TRUE)
+    ),
+    
+    Resource_Pressure = (
+      Electricity_Pressure +
+        Waste_Pressure
+    ) / 2
+  )
+
+#18 prepare ml data
+ml_data <- profile_2024 %>%
+  filter(
+    !is.na(Tourism_Intensity),
+    !is.na(Resource_Pressure)
+  ) %>%
+  select(
+    State,
+    Tourism_Intensity,
+    Resource_Pressure
+  )
+ml_scaled <- scale(
+  ml_data %>%
+    select(
+      Tourism_Intensity,
+      Resource_Pressure
+    )
+)
+
+#19 run kmeans
+set.seed(123)
+
+kmeans_model <- kmeans(
+  ml_scaled,
+  centers = 4,
+  nstart = 25
+)
+ml_data$Cluster <- kmeans_model$cluster
+ml_data %>%
+  arrange(Cluster)
+
+#20 naming clusters
+cluster_labels <- c(
+  "1" = "Sustainable Expansion",
+  "2" = "Monitor",
+  "3" = "Priority Intervention",
+  "4" = "Resource Efficiency"
+)
+
+ml_data <- ml_data %>%
+  mutate(
+    Profile = cluster_labels[as.character(Cluster)]
+  )
+ml_data %>%
+  arrange(Cluster)
+
+ml_data %>%
+  count(Profile)
+ml_data %>%
+  select(
+    State,
+    Tourism_Intensity,
+    Resource_Pressure,
+    Profile
+  ) %>%
+  arrange(desc(Tourism_Intensity))
+
+#21 create baseline forecast
+baseline_forecast <- hotel_state %>%
+  filter(Year == 2025) %>%
+  select(
+    State,
+    Hotel_Guests_2025 = Hotel_Guests
+  ) %>%
+  crossing(
+    Year = 2026:2030
+  ) %>%
+  mutate(
+    Forecast_Hotel_Guests = Hotel_Guests_2025
+  )
+forecast_summary <- baseline_forecast %>%
+  filter(Year == 2030) %>%
+  mutate(
+    Projected_Growth = 0
+  )
+forecast_summary
+
+#22 combine 
+final_rq4 <- forecast_summary %>%
+  select(
+    State,
+    Hotel_Guests_2025,
+    Forecast_2030 = Forecast_Hotel_Guests,
+    Projected_Growth
+  ) %>%
+  left_join(
+    ml_data %>%
+      select(
+        State,
+        Tourism_Intensity,
+        Resource_Pressure,
+        Profile
+      ),
+    by = "State"
+  )
+final_rq4
+
+#export
+write.csv(
+  final_rq4,
+  "RQ4_Final_Decision_Table.csv",
+  row.names = FALSE
+)
+file.exists("RQ4_Final_Decision_Table.csv")
+
+range(energy_state$Year, na.rm = TRUE)
+range(waste_ml$Year, na.rm = TRUE)
+names(energy_state)
+names(waste_ml)
+
+library(dplyr)
+library(forecast)
+
+# -----------------------------
+# ELECTRICITY VALIDATION
+# -----------------------------
+
+electricity_total <- energy_state %>%
+  group_by(Year) %>%
+  summarise(
+    Electricity = sum(Electricity, na.rm = TRUE)
+  ) %>%
+  arrange(Year)
+
+# Training: up to 2023
+electricity_train <- electricity_total %>%
+  filter(Year <= 2023)
+
+# Test: 2024-2025
+electricity_test <- electricity_total %>%
+  filter(Year >= 2024)
+
+y_train <- ts(
+  electricity_train$Electricity,
+  start = min(electricity_train$Year),
+  frequency = 1
+)
+
+# Models
+electricity_naive <- naive(y_train, h = 2)
+electricity_drift <- rwf(y_train, h = 2, drift = TRUE)
+electricity_ets <- forecast(ets(y_train), h = 2)
+electricity_arima <- forecast(auto.arima(y_train), h = 2)
+
+actual_electricity <- electricity_test$Electricity
+
+# RMSE
+electricity_rmse <- c(
+  Naive = sqrt(mean((electricity_naive$mean - actual_electricity)^2)),
+  Drift = sqrt(mean((electricity_drift$mean - actual_electricity)^2)),
+  ETS = sqrt(mean((electricity_ets$mean - actual_electricity)^2)),
+  ARIMA = sqrt(mean((electricity_arima$mean - actual_electricity)^2))
+)
+
+# MAE
+electricity_mae <- c(
+  Naive = mean(abs(electricity_naive$mean - actual_electricity)),
+  Drift = mean(abs(electricity_drift$mean - actual_electricity)),
+  ETS = mean(abs(electricity_ets$mean - actual_electricity)),
+  ARIMA = mean(abs(electricity_arima$mean - actual_electricity))
+)
+
+electricity_rmse
+electricity_mae
+
+# -----------------------------
+# WASTE VALIDATION
+# -----------------------------
+
+waste_total <- waste_ml %>%
+  group_by(Year) %>%
+  summarise(
+    Waste = sum(`Estimated Waste Per Year (kg)`, na.rm = TRUE)
+  ) %>%
+  arrange(Year)
+
+# Training: up to 2022
+waste_train <- waste_total %>%
+  filter(Year <= 2022)
+
+# Test: 2023-2024
+waste_test <- waste_total %>%
+  filter(Year >= 2023)
+
+y_train_waste <- ts(
+  waste_train$Waste,
+  start = min(waste_train$Year),
+  frequency = 1
+)
+
+# Models
+waste_naive <- naive(y_train_waste, h = 2)
+waste_drift <- rwf(y_train_waste, h = 2, drift = TRUE)
+waste_ets <- forecast(ets(y_train_waste), h = 2)
+waste_arima <- forecast(auto.arima(y_train_waste), h = 2)
+
+actual_waste <- waste_test$Waste
+
+# RMSE
+waste_rmse <- c(
+  Naive = sqrt(mean((waste_naive$mean - actual_waste)^2)),
+  Drift = sqrt(mean((waste_drift$mean - actual_waste)^2)),
+  ETS = sqrt(mean((waste_ets$mean - actual_waste)^2)),
+  ARIMA = sqrt(mean((waste_arima$mean - actual_waste)^2))
+)
+
+# MAE
+waste_mae <- c(
+  Naive = mean(abs(waste_naive$mean - actual_waste)),
+  Drift = mean(abs(waste_drift$mean - actual_waste)),
+  ETS = mean(abs(waste_ets$mean - actual_waste)),
+  ARIMA = mean(abs(waste_arima$mean - actual_waste))
+)
+
+waste_rmse
+waste_mae
+
+# ==========================================
+# FINAL 2030 RESOURCE PROJECTIONS
+# ==========================================
+
+# ---------- ELECTRICITY ----------
+electricity_ts <- ts(
+  electricity_total$Electricity,
+  start = min(electricity_total$Year),
+  frequency = 1
+)
+
+electricity_final <- rwf(
+  electricity_ts,
+  h = 5,
+  drift = TRUE
+)
+
+electricity_2030 <- as.numeric(
+  electricity_final$mean[5]
+)
+
+electricity_2030
+
+# ---------- WASTE ----------
+waste_ts <- ts(
+  waste_total$Waste,
+  start = min(waste_total$Year),
+  frequency = 1
+)
+
+waste_final <- naive(
+  waste_ts,
+  h = 6
+)
+
+waste_2030 <- as.numeric(
+  waste_final$mean[6]
+)
+
+waste_2030
+
+# ==========================================
+# FINAL 2030 RESOURCE KPI TABLE
+# ==========================================
+
+resource_2030_kpi <- data.frame(
+  Indicator = c(
+    "Electricity",
+    "Waste"
+  ),
+  Year = c(
+    2030,
+    2030
+  ),
+  Projected_Value = c(
+    electricity_2030,
+    waste_2030
+  ),
+  Unit = c(
+    "ktoe",
+    "kg"
+  )
+)
+
+# Check the final values
+resource_2030_kpi
+
+# Export for Power BI
+write.csv(
+  resource_2030_kpi,
+  "RQ4_2030_Resource_KPI.csv",
+  row.names = FALSE
+)
